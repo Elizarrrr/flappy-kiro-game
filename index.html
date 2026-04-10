@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flappy Kiro</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #1a1a2e;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+
+    #gameCanvas {
+      display: block;
+      /* Fixed logical resolution; CSS scales it to fit the viewport */
+      width: 480px;
+      height: 640px;
+      max-width: 100vw;
+      max-height: 100vh;
+      /* Maintain aspect ratio when viewport is smaller */
+      object-fit: contain;
+      image-rendering: pixelated;
+    }
+
+    @media (max-aspect-ratio: 480/640) {
+      #gameCanvas {
+        width: 100vw;
+        height: calc(100vw * 640 / 480);
+      }
+    }
+
+    @media (min-aspect-ratio: 480/640) {
+      #gameCanvas {
+        height: 100vh;
+        width: calc(100vh * 480 / 640);
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="480" height="640"></canvas>
+
+  <!-- Background music (non-fatal if missing) -->
+  <audio id="bgMusic" src="assets/bg_music.ogg" loop></audio>
+
+  <!-- Pure game logic module (physics, collision, scoring, spawning) -->
+  <script src="game-logic.js"></script>
+
+  <script>
+    // ─── CONFIG ──────────────────────────────────────────────────────────────
+    const CONFIG = {
+      // Physics
+      gravity:              0.5,
+      flapVelocity:        -9,
+      maxFallSpeed:         12,
+
+      // Pipes
+      pipeSpeed:            2.5,
+      pipeInterval:         1800,  // ms between pipe spawns
+      pipeWidth:            52,
+      gapHeight:            140,
+
+      // Canvas
+      canvasW:              480,
+      canvasH:              640,
+      scoreBarH:            36,
+
+      // Screen shake
+      shakeDuration:        400,   // ms
+      shakeMagnitude:       6,     // max pixel offset
+
+      // Particles
+      particleOpacityDecay: 0.03,
+
+      // Score popup
+      popupMaxAge:          800,   // ms
+
+      // Audio
+      musicVolume:          0.4,
+
+      // Cloud layers: index 0 = far, 1 = mid, 2 = near
+      cloudLayers: [
+        { speed: 0.3, opacity: 0.15 },
+        { speed: 0.6, opacity: 0.25 },
+        { speed: 1.0, opacity: 0.40 },
+      ],
+    };
+
+    // ─── STATE ───────────────────────────────────────────────────────────────
+
+    const gameState = {
+      phase: 'LOADING',
+      score: 0,
+      highScore: loadHighScore(),
+      lastTimestamp: 0,
+    };
+
+    const ghosty = {
+      x: 80,
+      y: 320,
+      vy: 0,
+      width: 40,
+      height: 40,
+      rotation: 0,        // radians
+    };
+
+    let pipes       = [];
+    let clouds      = [];
+    let particles   = [];
+    let scorePopups = [];
+
+    const shakeState = {
+      active:    false,
+      duration:  CONFIG.shakeDuration,
+      elapsed:   0,
+      magnitude: CONFIG.shakeMagnitude,
+      offsetX:   0,
+      offsetY:   0,
+    };
+
+    // ─── CANVAS SETUP ────────────────────────────────────────────────────────
+
+    const canvas = document.getElementById('gameCanvas');
+    const ctx    = canvas.getContext('2d');
+
+    // ─── ASSETS ──────────────────────────────────────────────────────────────
+
+    let ghostyImage   = null;
+    let jumpBuffer    = null;
+    let gameOverBuffer = null;
+    let audioCtx      = null;
+
+    const bgMusic = document.getElementById('bgMusic');
+    bgMusic.volume = CONFIG.musicVolume;
+    bgMusic.addEventListener('error', () => {
+      console.warn('Background music failed to load — continuing without music.');
+    });
+
+    // ─── RENDERING PIPELINE ─────────────────────────────────────────────────
+
+    /** Task 12.1 — solid sky fill + sketchy grid lines */
+    function drawBackground(ctx, config) {
+      ctx.fillStyle = '#87CEEB';
+      ctx.fillRect(0, 0, config.canvasW, config.canvasH);
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 1;
+      const step = 40;
+      for (let x = 0; x < config.canvasW; x += step) {
+        ctx.beginPath();
+        ctx.moveTo(x + (Math.random() - 0.5) * 2, 0);
+        ctx.lineTo(x + (Math.random() - 0.5) * 2, config.canvasH);
+        ctx.stroke();
+      }
+      for (let y = 0; y < config.canvasH; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(0, y + (Math.random() - 0.5) * 2);
+        ctx.lineTo(config.canvasW, y + (Math.random() - 0.5) * 2);
+        ctx.stroke();
+      }
+    }
+
+    /** Task 12.2 — clouds rendered far→near by layer index */
+    function drawClouds(ctx, clouds, config) {
+      for (let layer = 0; layer < config.cloudLayers.length; layer++) {
+        const opacity = config.cloudLayers[layer].opacity;
+        ctx.fillStyle = `rgba(255,255,255,${opacity})`;
+        for (const cloud of clouds) {
+          if (cloud.layer !== layer) continue;
+          ctx.beginPath();
+          const rx = cloud.width / 2;
+          const ry = cloud.height / 2;
+          ctx.ellipse(cloud.x + rx, cloud.y + ry, rx, ry, 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    /** Task 12.3 — green pipe segments with sketchy border */
+    function drawPipes(ctx, pipes, config) {
+      for (const pipe of pipes) {
+        const topH    = pipe.gapY;
+        const bottomY = pipe.gapY + pipe.gapHeight;
+        const bottomH = config.canvasH - config.scoreBarH - bottomY;
+
+        // Fill
+        ctx.fillStyle = '#4CAF50';
+        ctx.fillRect(pipe.x, 0, pipe.width, topH);
+        ctx.fillRect(pipe.x, bottomY, pipe.width, bottomH);
+
+        // Sketchy border
+        ctx.strokeStyle = '#2E7D32';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(pipe.x + 1, 0, pipe.width - 2, topH);
+        ctx.strokeRect(pipe.x + 1, bottomY, pipe.width - 2, bottomH);
+
+        // Highlight stripe
+        ctx.fillStyle = 'rgba(255,255,255,0.15)';
+        ctx.fillRect(pipe.x + 4, 0, 6, topH);
+        ctx.fillRect(pipe.x + 4, bottomY, 6, bottomH);
+      }
+    }
+
+    /** Task 12.4 — rotated sprite centered on ghosty's bounding box */
+    function drawGhosty(ctx, ghosty, image) {
+      const cx = ghosty.x + ghosty.width / 2;
+      const cy = ghosty.y + ghosty.height / 2;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(ghosty.rotation);
+      if (image) {
+        ctx.drawImage(image, -ghosty.width / 2, -ghosty.height / 2, ghosty.width, ghosty.height);
+      } else {
+        // Fallback: white rectangle
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(-ghosty.width / 2, -ghosty.height / 2, ghosty.width, ghosty.height);
+      }
+      ctx.restore();
+    }
+
+    /** Task 12.5 — semi-transparent trailing particle circles */
+    function drawParticles(ctx, particles) {
+      for (const p of particles) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(200,220,255,${p.opacity})`;
+        ctx.fill();
+      }
+    }
+
+    /** Task 12.6 — floating "+1" score popups */
+    function drawScorePopups(ctx, popups) {
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 20px monospace';
+      for (const p of popups) {
+        ctx.fillStyle = `rgba(255,230,0,${p.opacity})`;
+        ctx.fillText('+1', p.x, p.y);
+      }
+    }
+
+    /** Task 12.7 — bottom score bar overlay */
+    function drawScoreBar(ctx, score, highScore, config) {
+      const barY = config.canvasH - config.scoreBarH;
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(0, barY, config.canvasW, config.scoreBarH);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(formatScoreBar(score, highScore), config.canvasW / 2, barY + config.scoreBarH / 2 + 6);
+    }
+
+    /** Task 12.8 — start and game-over overlay screens */
+    function drawStartScreen(ctx, config) {
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(0, 0, config.canvasW, config.canvasH);
+
+      // Draw ghosty sprite centered if available
+      if (ghostyImage) {
+        const iw = 64, ih = 64;
+        ctx.drawImage(ghostyImage, config.canvasW / 2 - iw / 2, config.canvasH / 2 - 100, iw, ih);
+      }
+
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 36px monospace';
+      ctx.fillText('Flappy Kiro', config.canvasW / 2, config.canvasH / 2 - 10);
+      ctx.font = '18px monospace';
+      ctx.fillStyle = '#ffe';
+      ctx.fillText('Press Space or Tap to Start', config.canvasW / 2, config.canvasH / 2 + 30);
+    }
+
+    function drawGameOverScreen(ctx, score, highScore, config) {
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(0, 0, config.canvasW, config.canvasH);
+
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ff6b6b';
+      ctx.font = 'bold 40px monospace';
+      ctx.fillText('Game Over', config.canvasW / 2, config.canvasH / 2 - 60);
+
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 22px monospace';
+      ctx.fillText(`Score: ${score}`, config.canvasW / 2, config.canvasH / 2 - 10);
+      ctx.fillText(`Best:  ${highScore}`, config.canvasW / 2, config.canvasH / 2 + 25);
+
+      ctx.font = '16px monospace';
+      ctx.fillStyle = '#ffe';
+      ctx.fillText('Press Space or Tap to Restart', config.canvasW / 2, config.canvasH / 2 + 70);
+    }
+
+    // ─── GAME LOOP (Task 13.1) ───────────────────────────────────────────────
+
+    let rafId          = null;
+    let pipeSpawnTimer = 0;
+    let cloudSpawnTimer = 0;
+    const CLOUD_INTERVAL = 2200; // ms between cloud spawns
+
+    function gameLoop(timestamp) {
+      const dt = Math.min(timestamp - gameState.lastTimestamp, 100);
+      gameState.lastTimestamp = timestamp;
+
+      if (gameState.phase === 'PLAYING') {
+        // Physics
+        tickGhosty(ghosty, CONFIG);
+
+        // Pipe spawning
+        pipeSpawnTimer += dt;
+        if (pipeSpawnTimer >= CONFIG.pipeInterval) {
+          pipes.push(spawnPipe(CONFIG));
+          pipeSpawnTimer = 0;
+        }
+        pipes = scrollPipes(pipes, CONFIG);
+
+        // Cloud spawning
+        cloudSpawnTimer += dt;
+        if (cloudSpawnTimer >= CLOUD_INTERVAL) {
+          clouds.push(spawnCloud(CONFIG));
+          cloudSpawnTimer = 0;
+        }
+        clouds = scrollClouds(clouds, CONFIG);
+
+        // Particles
+        particles.push(emitParticle(ghosty, CONFIG));
+        particles = tickParticles(particles, CONFIG);
+
+        // Score popups
+        scorePopups = tickScorePopups(scorePopups, dt, CONFIG);
+
+        // Scoring
+        const { score: newScore, newlyScored } = checkScoring(ghosty, pipes, gameState.score);
+        gameState.score = newScore;
+        for (const pipe of newlyScored) {
+          scorePopups.push(spawnScorePopup(pipe, CONFIG));
+        }
+
+        // Screen shake tick
+        tickShake(shakeState, dt, CONFIG);
+
+        // Collision detection
+        const hitBoundary = checkBoundaryCollision(ghosty, CONFIG);
+        let hitPipe = false;
+        for (const pipe of pipes) {
+          const topRect    = { x: pipe.x, y: 0,          width: pipe.width, height: pipe.gapY };
+          const bottomRect = { x: pipe.x, y: pipe.gapY + pipe.gapHeight, width: pipe.width, height: CONFIG.canvasH - CONFIG.scoreBarH - (pipe.gapY + pipe.gapHeight) };
+          if (checkAABB(ghosty, topRect) || checkAABB(ghosty, bottomRect)) {
+            hitPipe = true;
+            break;
+          }
+        }
+
+        if (hitBoundary || hitPipe) {
+          gameState.phase = 'GAME_OVER';
+          if (gameState.score > gameState.highScore) {
+            gameState.highScore = gameState.score;
+            saveHighScore(gameState.highScore);
+          }
+          playSound(gameOverBuffer);
+          bgMusic.pause();
+          triggerShake(shakeState, CONFIG);
+        }
+      } else {
+        // Still scroll clouds on non-playing screens for visual interest
+        cloudSpawnTimer += dt;
+        if (cloudSpawnTimer >= CLOUD_INTERVAL) {
+          clouds.push(spawnCloud(CONFIG));
+          cloudSpawnTimer = 0;
+        }
+        clouds = scrollClouds(clouds, CONFIG);
+        tickShake(shakeState, dt, CONFIG);
+      }
+
+      // ── Render ──────────────────────────────────────────────────────────
+      ctx.save();
+      if (shakeState.active) {
+        ctx.translate(shakeState.offsetX || 0, shakeState.offsetY || 0);
+      }
+
+      drawBackground(ctx, CONFIG);
+      drawClouds(ctx, clouds, CONFIG);
+      drawPipes(ctx, pipes, CONFIG);
+      drawParticles(ctx, particles);
+      drawGhosty(ctx, ghosty, ghostyImage);
+      drawScorePopups(ctx, scorePopups);
+      drawScoreBar(ctx, gameState.score, gameState.highScore, CONFIG);
+
+      if (gameState.phase === 'START') {
+        drawStartScreen(ctx, CONFIG);
+      } else if (gameState.phase === 'GAME_OVER') {
+        drawGameOverScreen(ctx, gameState.score, gameState.highScore, CONFIG);
+      }
+
+      ctx.restore();
+
+      rafId = requestAnimationFrame(gameLoop);
+    }
+
+    function startGameLoop() {
+      if (rafId) cancelAnimationFrame(rafId);
+      gameState.lastTimestamp = performance.now();
+      rafId = requestAnimationFrame(gameLoop);
+    }
+
+    // ─── START / RESTART (Task 13.2) ─────────────────────────────────────────
+
+    function startGame() {
+      gameState.phase = 'PLAYING';
+      gameState.score = 0;
+      pipes       = [];
+      particles   = [];
+      scorePopups = [];
+      pipeSpawnTimer  = CONFIG.pipeInterval; // spawn first pipe immediately
+      cloudSpawnTimer = 0;
+      ghosty.y  = 320;
+      ghosty.vy = 0;
+      ghosty.rotation = 0;
+      bgMusic.currentTime = 0;
+      bgMusic.play().catch(() => {});
+    }
+
+    function restartGame() {
+      gameState.score = 0;
+      pipes       = [];
+      particles   = [];
+      scorePopups = [];
+      pipeSpawnTimer  = CONFIG.pipeInterval;
+      cloudSpawnTimer = 0;
+      ghosty.y  = 320;
+      ghosty.vy = 0;
+      ghosty.rotation = 0;
+      gameState.phase = 'PLAYING';
+      bgMusic.currentTime = 0;
+      bgMusic.play().catch(() => {});
+    }
+
+    // ─── ASSET LOADING ───────────────────────────────────────────────────────
+
+    async function loadAssets() {
+      // Show loading indicator while assets are fetching
+      ctx.fillStyle = '#87CEEB';
+      ctx.fillRect(0, 0, CONFIG.canvasW, CONFIG.canvasH);
+      ctx.fillStyle = '#333';
+      ctx.font = 'bold 20px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Flappy Kiro — Loading…', CONFIG.canvasW / 2, CONFIG.canvasH / 2);
+
+      // Create AudioContext for sound effects
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      // Helper: load an HTMLImageElement from a URL
+      function loadImage(src) {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error(`Failed to load: ${src}`));
+          img.src = src;
+        });
+      }
+
+      // Helper: fetch and decode an AudioBuffer from a URL
+      function loadAudioBuffer(src) {
+        return fetch(src)
+          .then(res => {
+            if (!res.ok) throw new Error(`Failed to load: ${src}`);
+            return res.arrayBuffer();
+          })
+          .then(arrayBuffer => audioCtx.decodeAudioData(arrayBuffer))
+          .catch(() => { throw new Error(`Failed to load: ${src}`); });
+      }
+
+      try {
+        const [img, jumpBuf, gameOverBuf] = await Promise.all([
+          loadImage('assets/ghosty.png'),
+          loadAudioBuffer('assets/jump.wav'),
+          loadAudioBuffer('assets/game_over.wav'),
+        ]);
+
+        ghostyImage    = img;
+        jumpBuffer     = jumpBuf;
+        gameOverBuffer = gameOverBuf;
+
+        gameState.phase = 'START';
+        startGameLoop();
+      } catch (err) {
+        gameState.phase = 'ERROR';
+        ctx.fillStyle = '#87CEEB';
+        ctx.fillRect(0, 0, CONFIG.canvasW, CONFIG.canvasH);
+        ctx.fillStyle = '#c0392b';
+        ctx.font = 'bold 18px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Error loading assets', CONFIG.canvasW / 2, CONFIG.canvasH / 2 - 20);
+        ctx.fillStyle = '#333';
+        ctx.font = '14px monospace';
+        ctx.fillText(err.message, CONFIG.canvasW / 2, CONFIG.canvasH / 2 + 16);
+      }
+    }
+
+    // Kick off asset loading
+    loadAssets();
+
+    // ─── AUDIO HELPER ────────────────────────────────────────────────────────
+
+    /**
+     * Play an AudioBuffer via the Web Audio API.
+     * Gracefully handles null audioCtx or null buffer.
+     * @param {AudioBuffer|null} buffer
+     */
+    function playSound(buffer) {
+      if (!audioCtx || !buffer) return;
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+    }
+
+    // ─── INPUT HANDLERS ──────────────────────────────────────────────────────
+
+    /** Called while PLAYING — apply upward velocity and play jump sound. */
+    function handleFlap() {
+      ghosty.vy = CONFIG.flapVelocity;
+      playSound(jumpBuffer);
+    }
+
+    /** Called while on START screen — begin the game. */
+    function handleStart() {
+      startGame();
+    }
+
+    /** Called while on GAME_OVER screen — restart the game. */
+    function handleRestart() {
+      restartGame();
+    }
+
+    /** Central dispatcher for all player input events. */
+    function handleInput() {
+      if (gameState.phase === 'PLAYING') {
+        handleFlap();
+      } else if (gameState.phase === 'START') {
+        handleStart();
+      } else if (gameState.phase === 'GAME_OVER') {
+        handleRestart();
+      }
+    }
+
+    // Attach listeners to the canvas
+    canvas.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        handleInput();
+      }
+    });
+
+    canvas.addEventListener('click', () => {
+      handleInput();
+    });
+
+    canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      handleInput();
+    }, { passive: false });
+
+    // Make canvas focusable so keydown events fire on it
+    canvas.setAttribute('tabindex', '0');
+    canvas.focus();
+  </script>
+</body>
+</html>
